@@ -1,7 +1,6 @@
 <?php
 /**
  * Plugin Name: REST Lockdown
- * Plugin URI:    https://github.com/menj/rest-lockdown
  * Description: Emergency measure against unauthorized casino/gambling spam
  *              being posted via the REST API using compromised credentials.
  *              (1) Disables Application Passwords entirely. (2) Rate-limits
@@ -104,15 +103,6 @@ add_filter( 'rest_post_dispatch', 'brl_trace_rest_response', 999, 3 );
  * It deliberately does NOT log Authorization, Cookie, or other credential
  * headers. Request bodies are disabled by default.
  */
-/**
- * Admin-only attribution.
- */
-add_filter( 'admin_footer_text', 'brl_admin_footer_attribution' );
-
-function brl_admin_footer_attribution( $text ) {
-    return $text . ' &nbsp; REST Lockdown by <a href="https://menj.blog" rel="author">MENJ</a>';
-}
-
 function brl_trace_rest_request( $result, $server, $request ) {
     if ( ! BRL_TRACE_REST ) {
         return $result;
