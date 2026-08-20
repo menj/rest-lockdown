@@ -1,5 +1,7 @@
 # REST Lockdown
 
+**GitHub:** https://github.com/menj/rest-lockdown
+
 **Emergency WordPress security plugin for REST API content-spam containment and forensic tracing.**
 
 REST Lockdown is a defensive, temporary WordPress plugin designed for incidents involving unauthorized content creation through the WordPress REST API.
@@ -568,6 +570,10 @@ Remove it after:
 - server-level persistence has been ruled out or removed.
 
 Do not treat permanent use of restrictive emergency controls as a substitute for remediation.
+
+## Attribution
+
+When active, REST Lockdown adds a discreet **REST Lockdown by MENJ** attribution link to the WordPress administration footer. It does not inject a hidden backlink into the public website.
 
 ## Version
 
