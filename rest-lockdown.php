@@ -17,7 +17,7 @@
  *              content-mutating XML-RPC methods.
  *              REMOVE once root cause (leaked/weak password, missing 2FA)
  *              is fixed — this is a stopgap, not a permanent fix.
- * Version:     3.1
+ * Version:     4.0
  *
  * Changelog vs the 1.0.0 draft this was merged from:
  * - FIX: quarantine was keyed by (user+IP) pair, so it silently found and
@@ -96,6 +96,12 @@ if ( ! defined( 'BRL_TRACE_HEADERS' ) )   define( 'BRL_TRACE_HEADERS', false );
 // /batch/v1 protection at the WordPress layer and expose a ready-to-copy
 // WAF rule pattern in the plugin comments below.
 if ( ! defined( 'BRL_BLOCK_BATCH_ENDPOINT' ) ) define( 'BRL_BLOCK_BATCH_ENDPOINT', true );
+if ( ! defined( 'BRL_CONTENT_SCAN_ENABLED' ) ) define( 'BRL_CONTENT_SCAN_ENABLED', true );
+if ( ! defined( 'BRL_CONTENT_SCAN_POST_TYPES' ) ) define( 'BRL_CONTENT_SCAN_POST_TYPES', array( 'post', 'page' ) );
+if ( ! defined( 'BRL_CLEANUP_EXISTING_SPAM' ) ) define( 'BRL_CLEANUP_EXISTING_SPAM', true );
+if ( ! defined( 'BRL_CLEANUP_BATCH_SIZE' ) ) define( 'BRL_CLEANUP_BATCH_SIZE', 100 );
+if ( ! defined( 'BRL_CLEANUP_ACTION' ) ) define( 'BRL_CLEANUP_ACTION', 'trash' );
+
 
 
 /* ============================================================
@@ -116,6 +122,10 @@ add_filter( 'rest_pre_dispatch', 'brl_trace_rest_request', 5, 3 );
 add_filter( 'rest_pre_dispatch', 'brl_guard_rest_writes', 10, 3 );
 add_filter( 'rest_post_dispatch', 'brl_track_created_content_from_response', 20, 3 );
 add_filter( 'rest_post_dispatch', 'brl_trace_rest_response', 999, 3 );
+add_filter( 'rest_pre_insert_post', 'brl_scan_rest_content', 10, 2 );
+add_filter( 'rest_pre_insert_page', 'brl_scan_rest_content', 10, 2 );
+add_filter( 'wp_insert_post_data', 'brl_scan_save_data', 10, 2 );
+
 
 /**
  * Forensic REST trace (request side). Purely diagnostic — see BRL_TRACE_REST.
@@ -399,6 +409,75 @@ function brl_trace_log( $record ) {
 }
 
 /* ============================================================
+ * 3. Content anti-gambling/SEO-spam scanner.
+ * ============================================================ */
+function brl_gambling_match( $text ) {
+    $text = html_entity_decode( (string) $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+    $rules = array(
+        'gambling-link' => '/<a\b[^>]*href\s*=\s*["\'][^"\']*(?:casino|bet|bets|betting|gambl|slot|poker|jackpot|roulette|blackjack)[^"\']*["\'][^>]*>/i',
+        'gambling-anchor' => '/<a\b[^>]*>[^<]*(?:casino|betting|gambling|jackpot|roulette|blackjack|poker|slots?)\b[^<]*<\/a>/is',
+        'hidden-gambling' => '/(?:left\s*:\s*-\s*\d+px|top\s*:\s*-\s*\d+px|display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?:px)?|opacity\s*:\s*0)[^>]*>.*?(?:casino|betting|gambling|jackpot|roulette|blackjack|poker|slots?)/is',
+        'gambling-cluster' => '/\b(?:casino|casinos|betting|sportsbook|jackpot|roulette|blackjack|poker|slots?|wager|odds|bookmaker|bookie|gambling|bet\s+online|online\s+casino)\b/i'
+    );
+    foreach ( $rules as $name => $regex ) {
+        if ( preg_match( $regex, $text ) ) {
+            if ( 'gambling-cluster' === $name ) {
+                $n = preg_match_all('/\b(?:casino|betting|sportsbook|jackpot|roulette|blackjack|poker|slots?|wager|bookmaker|gambling)\b/i', $text);
+                if ( $n < 2 && ! preg_match('/<a\b[^>]+href\s*=/i', $text) ) continue;
+            }
+            return $name;
+        }
+    }
+    return false;
+}
+function brl_strip_gambling_injection( $content ) {
+    $patterns = array(
+        '/<a\b[^>]*href\s*=\s*["\'][^"\']*(?:casino|bet|bets|betting|gambl|slot|poker|jackpot|roulette|blackjack)[^"\']*["\'][^>]*>.*?<\/a>/is',
+        '/<([a-z0-9]+)\b[^>]*style\s*=\s*["\'][^"\']*(?:left\s*:\s*-\s*\d+px|top\s*:\s*-\s*\d+px|display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?:px)?)[^"\']*["\'][^>]*>.*?(?:casino|betting|gambling|jackpot|roulette|blackjack|poker|slots?).*?<\/\1>/is'
+    );
+    foreach ( $patterns as $pattern ) $content = preg_replace( $pattern, '', (string) $content );
+    return $content;
+}
+function brl_scan_rest_content( $prepared, $request ) {
+    if ( ! BRL_CONTENT_SCAN_ENABLED || ! is_object( $prepared ) ) return $prepared;
+    $text = ( $prepared->post_title ?? '' ) . "\n" . ( $prepared->post_content ?? '' ) . "\n" . ( $prepared->post_excerpt ?? '' );
+    $match = brl_gambling_match( $text );
+    if ( ! $match ) return $prepared;
+    brl_log( 'BLOCKED (gambling content): ' . brl_get_ip() . ' -> ' . $request->get_method() . ' ' . $request->get_route() . ' | rule=' . $match );
+    return new WP_Error( 'brl_gambling_spam_blocked', 'The submitted content was rejected by the site security filter.', array( 'status' => 403 ) );
+}
+function brl_scan_save_data( $data, $postarr ) {
+    if ( ! BRL_CONTENT_SCAN_ENABLED ) return $data;
+    $type = isset($data['post_type']) ? sanitize_key($data['post_type']) : '';
+    if ( ! in_array($type, BRL_CONTENT_SCAN_POST_TYPES, true) ) return $data;
+    $text = ($data['post_title'] ?? '') . "\n" . ($data['post_content'] ?? '') . "\n" . ($data['post_excerpt'] ?? '');
+    $match = brl_gambling_match($text);
+    if (!$match) return $data;
+    $id = isset($postarr['ID']) ? absint($postarr['ID']) : 0;
+    brl_log("BLOCKED (save-boundary gambling scan): post_type=$type post_id=$id rule=$match");
+    $data['post_title'] = brl_strip_gambling_injection($data['post_title'] ?? '');
+    $data['post_content'] = brl_strip_gambling_injection($data['post_content'] ?? '');
+    $data['post_excerpt'] = brl_strip_gambling_injection($data['post_excerpt'] ?? '');
+    return $data;
+}
+function brl_cleanup_existing_gambling_spam() {
+    if ( ! BRL_CLEANUP_EXISTING_SPAM ) return 0;
+    $ids = get_posts(array('post_type'=>BRL_CONTENT_SCAN_POST_TYPES,'post_status'=>'any','posts_per_page'=>BRL_CLEANUP_BATCH_SIZE,'fields'=>'ids','orderby'=>'ID','order'=>'DESC'));
+    $count = 0;
+    foreach ($ids as $id) {
+        $p = get_post($id); if (!$p) continue;
+        $match = brl_gambling_match($p->post_title."\n".$p->post_content."\n".$p->post_excerpt);
+        if (!$match) continue;
+        if ('delete' === BRL_CLEANUP_ACTION) wp_delete_post($id, true); else wp_trash_post($id);
+        brl_log("ACTION: quarantined existing gambling content ID $id | rule=$match"); $count++;
+    }
+    return $count;
+}
+register_activation_hook(__FILE__, 'brl_cleanup_existing_gambling_spam');
+add_action('brl_daily_gambling_scan', 'brl_cleanup_existing_gambling_spam');
+if (!wp_next_scheduled('brl_daily_gambling_scan')) wp_schedule_event(time()+3*HOUR_IN_SECONDS, 'daily', 'brl_daily_gambling_scan');
+
+/* ============================================================
  * 3. The rate-limit / allowlist / app-passwords guard.
  * ============================================================ */
 function brl_guard_rest_writes( $result, $server, $request ) {
@@ -421,7 +500,7 @@ function brl_guard_rest_writes( $result, $server, $request ) {
         brl_log( 'BLOCKED (unauthenticated batch endpoint): ' . brl_get_ip() . " -> $method $route" );
         return new WP_Error(
             'brl_batch_blocked',
-            'Unauthenticated REST batch requests are disabled.',
+            'This endpoint is not available.',
             array( 'status' => 403 )
         );
     }
