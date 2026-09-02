@@ -17,7 +17,39 @@
  *              content-mutating XML-RPC methods.
  *              REMOVE once root cause (leaked/weak password, missing 2FA)
  *              is fixed — this is a stopgap, not a permanent fix.
- * Version:     4.0
+ * Version:     4.1
+ *
+ * Changelog vs 4.0 (after the 25-Aug-2026 incident: a new WordPress user,
+ * ID 174, was created via `POST /wp/v2/users` using the live session of
+ * the site's real admin account, and was never caught):
+ * - GAP: /wp/v2/users was only ever covered by the generic rate limiter
+ *   (3 writes / 10 min), same bucket as posts/pages/media. The attacker's
+ *   FIRST write in the burst was the user-creation call, so it sailed
+ *   through before the counter ever reached the cap — the limiter can
+ *   only ever catch the 2nd+ request from an identifier, never the 1st.
+ *   FIX: user creation via REST is now hard-blocked outright (like
+ *   Application Passwords already were), independent of any counter.
+ *   See BRL_BLOCK_USER_CREATION.
+ * - GAP: brl_route_post_type() only recognised 'posts'/'pages', so even
+ *   if the rate limit HAD later tripped, the created user was never
+ *   tracked and so was never auto-quarantined the way a spam post would
+ *   have been. FIX: any REST write to /wp/v2/users carrying a 'roles' or
+ *   'role' field is now also hard-blocked outright — a normal profile
+ *   edit (name/email/password) never needs to touch that field. See
+ *   BRL_BLOCK_ROLE_CHANGES.
+ * - GAP: the attacker's actual FIRST action in the log — an application-
+ *   passwords attempt at 11:19:53 — was correctly blocked, but nothing
+ *   killed their session until a SEPARATE rate-limit trip on a later,
+ *   unrelated media-upload burst at 11:20:08. That ~15-second gap is
+ *   exactly when the rogue user got created. FIX: any hard-blocked
+ *   critical action (app-passwords, user creation, role change) now
+ *   triggers an immediate session kill + email on its own, instead of
+ *   waiting for the rate limiter to separately trip. See
+ *   BRL_IMMEDIATE_LOCKOUT_ON_CRITICAL and brl_immediate_lockout().
+ * - ADDED: an unconditional alert email fires on ANY successful REST user
+ *   creation, regardless of the above settings — a canary in case
+ *   BRL_BLOCK_USER_CREATION is ever turned off or bypassed by a future
+ *   WP core change.
  *
  * Changelog vs the 1.0.0 draft this was merged from:
  * - FIX: quarantine was keyed by (user+IP) pair, so it silently found and
@@ -102,6 +134,31 @@ if ( ! defined( 'BRL_CLEANUP_EXISTING_SPAM' ) ) define( 'BRL_CLEANUP_EXISTING_SP
 if ( ! defined( 'BRL_CLEANUP_BATCH_SIZE' ) ) define( 'BRL_CLEANUP_BATCH_SIZE', 100 );
 if ( ! defined( 'BRL_CLEANUP_ACTION' ) ) define( 'BRL_CLEANUP_ACTION', 'trash' );
 
+// Hard-block creating new users via the REST API, outright — independent
+// of the rate limiter, same treatment as Application Passwords below.
+// This is the fix for the 25-Aug-2026 incident: /wp/v2/users was
+// previously only rate-limited, so the attacker's first (and only-needed)
+// call sailed through before any counter engaged. Leave true unless this
+// site has a legitimate integration that registers users via REST.
+if ( ! defined( 'BRL_BLOCK_USER_CREATION' ) ) define( 'BRL_BLOCK_USER_CREATION', true );
+
+// Hard-block any REST write to /wp/v2/users (create OR update) that
+// carries a 'roles' or 'role' field, regardless of the value requested.
+// A normal profile edit (name, email, password, bio) never needs to
+// touch this field, so this closes both "create a new admin" and
+// "promote an existing low-privilege account to admin" in one rule.
+if ( ! defined( 'BRL_BLOCK_ROLE_CHANGES' ) ) define( 'BRL_BLOCK_ROLE_CHANGES', true );
+
+// When a critical action above (app-passwords, user creation, role
+// change) is blocked, immediately kill the acting user's sessions and
+// email an alert right then — do not wait for the separate rate limiter
+// to trip on some later, possibly unrelated request. In the Aug 2026
+// incident the attacker's app-passwords attempt was blocked first, but
+// nothing killed their session until an unrelated media-upload burst
+// tripped the rate limit ~15 seconds later — and the rogue user was
+// created in that gap.
+if ( ! defined( 'BRL_IMMEDIATE_LOCKOUT_ON_CRITICAL' ) ) define( 'BRL_IMMEDIATE_LOCKOUT_ON_CRITICAL', true );
+
 
 
 /* ============================================================
@@ -121,6 +178,7 @@ add_filter( 'wp_is_application_passwords_available', '__return_false' );
 add_filter( 'rest_pre_dispatch', 'brl_trace_rest_request', 5, 3 );
 add_filter( 'rest_pre_dispatch', 'brl_guard_rest_writes', 10, 3 );
 add_filter( 'rest_post_dispatch', 'brl_track_created_content_from_response', 20, 3 );
+add_filter( 'rest_post_dispatch', 'brl_alert_on_user_created', 20, 3 );
 add_filter( 'rest_post_dispatch', 'brl_trace_rest_response', 999, 3 );
 add_filter( 'rest_pre_insert_post', 'brl_scan_rest_content', 10, 2 );
 add_filter( 'rest_pre_insert_page', 'brl_scan_rest_content', 10, 2 );
@@ -509,11 +567,45 @@ function brl_guard_rest_writes( $result, $server, $request ) {
         return $result; // only guard writes; reads are unaffected
     }
 
+    $ip  = brl_get_ip();
+    $uid = get_current_user_id(); // 0 if not authenticated
+
     // Application-passwords: always block outright, regardless of
     // allowlist/rate limit — redundant with the filter above by design.
     if ( preg_match( '#^/wp/v2/users/[^/]+/application-passwords#', $route ) ) {
-        brl_log( 'BLOCKED (application-passwords route): ' . brl_get_ip() . " -> $method $route" );
+        brl_log( 'BLOCKED (application-passwords route): ' . $ip . " -> $method $route" );
+        brl_immediate_lockout( $uid, $ip, $route, 'attempted to create an Application Password' );
         return new WP_Error( 'brl_app_passwords_disabled', 'Application Passwords are disabled.', array( 'status' => 403 ) );
+    }
+
+    // User creation via REST: hard-block outright, same treatment as
+    // Application Passwords. This is the actual fix for the Aug 2026
+    // incident — /wp/v2/users used to only be rate-limited alongside
+    // posts/pages/media, which can never catch a FIRST request from an
+    // identifier (the counter starts at 0). A brand-new, potentially
+    // admin-capable account should never be one unblocked REST call away.
+    if ( BRL_BLOCK_USER_CREATION && 'POST' === $method && preg_match( '#^/wp/v2/users(?:/|$)#', $route ) ) {
+        brl_log( 'BLOCKED (user creation via REST): ' . $ip . " -> $method $route" . ( $uid ? " (as uid $uid)" : ' (unauthenticated)' ) );
+        brl_immediate_lockout( $uid, $ip, $route, 'attempted to create a new user via REST' );
+        return new WP_Error( 'brl_user_creation_disabled', 'Creating users via the REST API is disabled on this site. Use wp-admin instead.', array( 'status' => 403 ) );
+    }
+
+    // Role changes via REST (create OR update): hard-block outright if the
+    // request body carries a 'roles' or 'role' field, whatever value it
+    // asks for. A normal profile edit (name/email/password/bio) never
+    // touches this field, so this also closes "promote an existing
+    // low-privilege account to admin" as a follow-up move, not just
+    // "create a brand-new admin".
+    if ( BRL_BLOCK_ROLE_CHANGES && preg_match( '#^/wp/v2/users(?:/|$)#', $route ) ) {
+        $params = $request->get_json_params();
+        if ( ! is_array( $params ) || empty( $params ) ) {
+            $params = $request->get_body_params();
+        }
+        if ( is_array( $params ) && ( isset( $params['roles'] ) || isset( $params['role'] ) ) ) {
+            brl_log( 'BLOCKED (role change via REST): ' . $ip . " -> $method $route" . ( $uid ? " (as uid $uid)" : ' (unauthenticated)' ) );
+            brl_immediate_lockout( $uid, $ip, $route, 'attempted to set/change a user role via REST' );
+            return new WP_Error( 'brl_role_change_disabled', 'Changing user roles via the REST API is disabled on this site. Use wp-admin instead.', array( 'status' => 403 ) );
+        }
     }
 
     $guarded_patterns = array(
@@ -531,9 +623,6 @@ function brl_guard_rest_writes( $result, $server, $request ) {
     if ( ! $is_guarded ) {
         return $result;
     }
-
-    $ip  = brl_get_ip();
-    $uid = get_current_user_id(); // 0 if not authenticated
 
     // Optional IP allowlist
     if ( ! empty( BRL_ALLOWED_IPS ) && ! in_array( $ip, BRL_ALLOWED_IPS, true ) ) {
@@ -671,6 +760,97 @@ function brl_quarantine_offending_content( $identifiers, $uid ) {
     }
 
     brl_log( 'ACTION: quarantined ' . $trashed . ' offending content item(s) for [' . implode( ', ', $identifiers ) . ']' );
+}
+
+/* ============================================================
+ * 4b. Immediate lockout on a single critical action — independent of the
+ *     rolling rate-limit window. Added after the Aug 2026 incident: the
+ *     attacker's actual first move (an app-passwords attempt) was already
+ *     hard-blocked and logged, but nothing killed their session until a
+ *     LATER, unrelated rate-limit trip on a media-upload burst — and the
+ *     rogue user got created in the gap between those two moments. Any
+ *     hard-blocked critical action now kills the acting session and
+ *     alerts on its own, so step two of a chained attack never gets a
+ *     still-live session to run on.
+ * ============================================================ */
+function brl_immediate_lockout( $uid, $ip, $route, $reason ) {
+    if ( ! BRL_IMMEDIATE_LOCKOUT_ON_CRITICAL || ! $uid ) {
+        return; // unauthenticated request — nothing to kill
+    }
+
+    $cooldown_key    = 'brl_lockout_' . md5( "user:$uid" );
+    $already_alerted = (bool) get_transient( $cooldown_key );
+    set_transient( $cooldown_key, 1, BRL_ALERT_COOLDOWN );
+
+    $user  = get_userdata( $uid );
+    $login = $user ? $user->user_login : "uid:$uid";
+
+    if ( BRL_AUTO_KILL_SESSION ) {
+        WP_Session_Tokens::get_instance( $uid )->destroy_all();
+        brl_log( "ACTION: immediate lockout - killed all sessions for user '{$login}' (uid {$uid}) after blocked critical action ({$reason}) from $ip" );
+    }
+
+    if ( BRL_ALERT_EMAIL && ! $already_alerted ) {
+        $body  = "A blocked critical action was attempted using user '{$login}' (uid {$uid}) from IP {$ip}.\n";
+        $body .= "Action: {$reason}\n";
+        $body .= "Route: {$route}\n\n";
+        if ( BRL_AUTO_KILL_SESSION ) {
+            $body .= "User '{$login}' has been force-logged-out of all sessions immediately (not waiting for the rate limit to separately trip).\n\n";
+        }
+        $body .= "This fired independently of the content-creation rate limit — treat it as a live compromise signal, not spam.\n\n";
+        $body .= "Recommended: reset this user's password now, check Users in wp-admin for any account created around this time, and review recently published content.\n\n";
+        $body .= 'Log: ' . BRL_LOG_FILE;
+
+        wp_mail(
+            BRL_ALERT_EMAIL,
+            'REST Lockdown: critical action blocked on ' . home_url(),
+            $body
+        );
+    }
+}
+
+/**
+ * Canary: alert on ANY successful user creation via REST, regardless of
+ * BRL_BLOCK_USER_CREATION. Under normal operation with that block enabled
+ * this should never fire — if it does, either the setting was turned off
+ * or something bypassed the guard, and either way it needs a look.
+ */
+function brl_alert_on_user_created( $response, $server, $request ) {
+    if ( ! BRL_ALERT_EMAIL || ! ( $response instanceof WP_HTTP_Response ) ) {
+        return $response;
+    }
+
+    $status = absint( $response->get_status() );
+    if ( $status < 200 || $status >= 300 ) {
+        return $response;
+    }
+
+    $route = $request->get_route();
+    if ( 'POST' !== strtoupper( $request->get_method() )
+        || ! preg_match( '#^/wp/v2/users(?:/|$)#', $route )
+        || preg_match( '#application-passwords#', $route ) ) {
+        return $response;
+    }
+
+    $data    = $response->get_data();
+    $new_id  = ( is_array( $data ) && isset( $data['id'] ) ) ? absint( $data['id'] ) : 0;
+    $ip      = brl_get_ip();
+    $uid     = get_current_user_id();
+    $user    = $uid ? get_userdata( $uid ) : false;
+    $actor   = $user ? $user->user_login : ( $uid ? "uid:$uid" : 'unauthenticated' );
+
+    brl_log( "ALERT: new user created via REST — new_user_id=$new_id actor=$actor ip=$ip" );
+
+    wp_mail(
+        BRL_ALERT_EMAIL,
+        'REST Lockdown: a new user was created via the REST API on ' . home_url(),
+        "A new WordPress user (ID {$new_id}) was created via the REST API.\n"
+        . "Acting user: {$actor}\nIP: {$ip}\n\n"
+        . "If BRL_BLOCK_USER_CREATION is enabled this should not have been possible — investigate immediately.\n"
+        . "If you intentionally disabled that setting, just verify this account and its role are what you expect."
+    );
+
+    return $response;
 }
 
 /* ============================================================
